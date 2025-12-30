@@ -9,6 +9,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolu
 import warnings
 import os
 from io import BytesIO
+from itertools import product
 
 warnings.filterwarnings('ignore')
 
@@ -255,9 +256,18 @@ def calculate_metrics(actual, predicted):
     """Calculate comprehensive accuracy metrics"""
     mae = mean_absolute_error(actual, predicted)
     rmse = np.sqrt(mean_squared_error(actual, predicted))
-    mape = mean_absolute_percentage_error(actual, predicted) * 100
     
-    # WMAPE
+    # Safe MAPE Calculation (avoid division by zero)
+    # Kita hanya menghitung MAPE untuk data dimana aktual != 0
+    non_zero_mask = actual != 0
+    if non_zero_mask.sum() > 0:
+        # Menghitung MAPE hanya pada data yang valid (tidak nol)
+        mape = np.mean(np.abs((actual[non_zero_mask] - predicted[non_zero_mask]) / actual[non_zero_mask])) * 100
+    else:
+        mape = 0.0 # Jika semua data 0, anggap MAPE 0 atau N/A
+    
+    # WMAPE (Weighted Mean Absolute Percentage Error)
+    # Ini lebih aman daripada MAPE untuk data yang banyak nol-nya
     sum_actuals = actual.sum()
     sum_errors = np.abs(actual - predicted).sum()
     wmape = (sum_errors / sum_actuals) * 100 if sum_actuals > 0 else 0
@@ -297,6 +307,85 @@ def export_forecast_results(forecast_df, phases, target_col):
     
     return output.getvalue()
 
+def auto_tune_prophet(train_df, target_col, regressors, holidays_df, use_log=False):
+    """
+    Perform Grid Search to find best hyperparameters on training data.
+    Uses last 20% of training data as validation set.
+    """
+    # Split data for tuning
+    cutoff = int(len(train_df) * 0.8)
+    tune_train = train_df.iloc[:cutoff].copy()
+    tune_val = train_df.iloc[cutoff:].copy()
+    
+    # Prepare tune dataframes
+    tune_train_df = tune_train.reset_index()
+    tune_train_df = tune_train_df.rename(columns={tune_train_df.columns[0]: 'ds', target_col: 'y'})
+    tune_train_df = tune_train_df[['ds', 'y'] + regressors]
+    
+    tune_val_df = tune_val.reset_index()
+    tune_val_df = tune_val_df.rename(columns={tune_val_df.columns[0]: 'ds', target_col: 'y'})
+    actuals = tune_val_df['y'].values
+    
+    if use_log:
+        tune_train_df['y'] = np.log1p(tune_train_df['y'])
+    
+    # Define Parameter Grid
+    param_grid = {
+        'changepoint_prior_scale': [0.01, 0.05, 0.5],
+        'seasonality_prior_scale': [1.0, 10.0],
+        'seasonality_mode': ['additive', 'multiplicative']
+    }
+    
+    all_params = [dict(zip(param_grid.keys(), v)) for v in product(*param_grid.values())]
+    
+    best_params = None
+    best_rmse = float('inf')
+    
+    # Create future dataframe for validation period
+    val_future = pd.DataFrame({'ds': tune_val_df['ds']})
+    
+    for params in all_params:
+        try:
+            m = Prophet(
+                yearly_seasonality=True, 
+                weekly_seasonality=True,
+                daily_seasonality=False,
+                holidays=holidays_df,
+                **params
+            )
+            
+            for reg in regressors:
+                m.add_regressor(reg)
+                
+            m.fit(tune_train_df)
+            
+            # Prepare prediction DF with regressors
+            pred_df = val_future.copy()
+            for reg in regressors:
+                # Naive mapping for tuning speed
+                hist_map = train_df[reg].to_dict()
+                pred_df[reg] = pred_df['ds'].map(hist_map).fillna(method='ffill')
+            
+            forecast = m.predict(pred_df)
+            
+            preds = forecast['yhat'].values
+            if use_log:
+                preds = np.expm1(preds)
+            
+            # Clip negative
+            preds = np.maximum(preds, 0)
+            
+            rmse = np.sqrt(mean_squared_error(actuals, preds))
+            
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_params = params
+                
+        except Exception:
+            continue
+            
+    return best_params
+
 # --- Session State Initialization ---
 if 'df_raw' not in st.session_state:
     st.session_state['df_raw'] = None
@@ -314,6 +403,8 @@ if 'future_target_df' not in st.session_state:
     st.session_state['future_target_df'] = None
 if 'model_params' not in st.session_state:
     st.session_state['model_params'] = {}
+if 'auto_tuned_params' not in st.session_state:
+    st.session_state['auto_tuned_params'] = None
 
 # --- Sidebar ---
 
@@ -374,22 +465,72 @@ with st.sidebar:
             
             st.header("🎯 Forecasting Strategy")
             
-            # --- ADVANCED SETTINGS ---
-            with st.expander("⚙️ Advanced Model Settings", expanded=False):
-                changepoint_scale = st.slider(
-                    "Changepoint Prior Scale",
-                    0.001, 0.5, 0.05, 0.001,
-                    help="Fleksibilitas model terhadap perubahan trend (lebih tinggi = lebih fleksibel)"
+            # --- ADVANCED SETTINGS (UPDATED) ---
+            with st.expander("⚙️ Optimasi Akurasi Model", expanded=True):
+                st.markdown("**🤖 Auto-Tuning**")
+                use_auto_tune = st.checkbox(
+                    "⚡ Optimasi Parameter Otomatis",
+                    value=False,
+                    help="Biarkan sistem mencari kombinasi parameter terbaik dengan menguji berbagai skenario pada data training. Proses ini mungkin memakan waktu beberapa detik."
                 )
-                seasonality_scale = st.slider(
-                    "Seasonality Prior Scale",
-                    0.01, 10.0, 10.0, 0.1,
-                    help="Kekuatan pola musiman (lebih tinggi = pola musiman lebih kuat)"
+                
+                if use_auto_tune and st.session_state['auto_tuned_params']:
+                    st.success(f"Best Params: {st.session_state['auto_tuned_params']}")
+
+                st.markdown("---")
+                st.markdown("**🔧 Parameter Manual (Diabaikan jika Auto-Tune aktif)**")
+                
+                # Seasonality Mode
+                seasonality_mode = st.selectbox(
+                    "Mode Musiman",
+                    ["additive", "multiplicative"],
+                    index=0,
+                    help="'Additive': Fluktuasi tetap (misal: selalu naik 100).\n'Multiplicative': Fluktuasi mengikuti tren (misal: naik 10%). Gunakan ini jika grafik 'melebar' ke kanan.",
+                    disabled=use_auto_tune
                 )
-                st.session_state['model_params'] = {
-                    'changepoint_prior_scale': changepoint_scale,
-                    'seasonality_prior_scale': seasonality_scale
-                }
+                
+                # Log Transform
+                use_log_transform = st.checkbox(
+                    "Gunakan Log Transformation",
+                    value=False,
+                    help="Centang ini jika data Anda memiliki variansi tinggi (misal: selisih nilai min dan max sangat jauh). Ini seringkali MENURUNKAN error secara drastis."
+                )
+                
+                # Outlier Removal
+                remove_outliers_pct = st.slider(
+                    "Hapus Outlier (Top %)", 
+                    0, 10, 0,
+                    help="Membuang X% data tertinggi (anomali) dari training data agar model tidak bingung."
+                )
+                
+                col_ft1, col_ft2 = st.columns(2)
+                with col_ft1:
+                    changepoint_scale = st.slider(
+                        "Changepoint Prior",
+                        0.001, 0.5, 0.05, 0.001,
+                        help="Fleksibilitas trend. Naikkan jika trend sering berubah drastis.",
+                        disabled=use_auto_tune
+                    )
+                with col_ft2:
+                    seasonality_scale = st.slider(
+                        "Seasonality Prior",
+                        0.01, 20.0, 10.0, 0.1,
+                        help="Kekuatan pola musiman. Naikkan jika pola harian/bulanan sangat kuat.",
+                        disabled=use_auto_tune
+                    )
+                
+                # Logic to set params based on auto-tune or manual
+                if not use_auto_tune:
+                    st.session_state['model_params'] = {
+                        'changepoint_prior_scale': changepoint_scale,
+                        'seasonality_prior_scale': seasonality_scale,
+                        'seasonality_mode': seasonality_mode
+                    }
+                    st.session_state['auto_tuned_params'] = None # Reset if switched to manual
+                elif st.session_state['auto_tuned_params']:
+                    # Apply auto tuned params
+                     st.session_state['model_params'] = st.session_state['auto_tuned_params']
+
             
             # --- PANDUAN PEMILIHAN VARIABEL ---
             with st.expander("📚 Panduan: Apa yang harus saya pilih?", expanded=False):
@@ -584,6 +725,30 @@ with tab1:
                         st.error("❌ Data training terlalu sedikit (min 60 hari). Pilih tahun target yang lebih besar.")
                         st.stop()
                     
+                    # --- FEATURE: OUTLIER REMOVAL ---
+                    if remove_outliers_pct > 0:
+                        upper_lim = train_data[target_col].quantile(1.0 - (remove_outliers_pct/100.0))
+                        original_len = len(train_data)
+                        # Filter rows where target column is below the quantile cutoff
+                        train_data = train_data[train_data[target_col] <= upper_lim]
+                        # Note: We keep rows, not just cap values, to avoid distortion in regressors
+                        removed_count = original_len - len(train_data)
+                        st.toast(f"🧹 Menghapus {removed_count} outlier dari training data")
+
+                    # --- FEATURE: AUTO-TUNING ---
+                    if use_auto_tune:
+                         with st.spinner("🤖 Sedang mencari parameter terbaik (Auto-Tuning)..."):
+                             best_params = auto_tune_prophet(
+                                 train_data, 
+                                 target_col, 
+                                 selected_regressors, 
+                                 holidays_df,
+                                 use_log=use_log_transform
+                             )
+                             st.session_state['auto_tuned_params'] = best_params
+                             st.session_state['model_params'] = best_params
+                             st.toast(f"✨ Parameter Terbaik: {best_params['seasonality_mode']} | CP: {best_params['changepoint_prior_scale']}")
+                    
                     if is_backtesting:
                         test_data = df_daily[df_daily.index.year == target_year].copy()
                         days_to_predict = len(test_data) if len(test_data) > 0 else 365
@@ -639,14 +804,15 @@ with tab1:
                     for reg in selected_regressors:
                         m_target.add_regressor(reg)
                         
-                    # --- ROBUST DATAFRAME PREPARATION (FIX FOR KEYERROR) ---
+                    # --- ROBUST DATAFRAME PREPARATION ---
                     df_target = train_data.reset_index()
-                    # Identify the date column (it's typically the first one after reset)
                     date_col_name = df_target.columns[0]
-                    # Rename securely
                     df_target = df_target.rename(columns={date_col_name: 'ds', target_col: 'y'})
-                    # Select only necessary columns
                     df_target = df_target[['ds', 'y'] + selected_regressors]
+                    
+                    # --- FEATURE: LOG TRANSFORMATION ---
+                    if use_log_transform:
+                        df_target['y'] = np.log1p(df_target['y'])
                     
                     m_target.fit(df_target)
                     
@@ -659,6 +825,17 @@ with tab1:
                     
                     future_target = future_target.fillna(method='ffill').fillna(method='bfill')
                     forecast = m_target.predict(future_target)
+                    
+                    # --- INVERSE LOG TRANSFORM (Important!) ---
+                    if use_log_transform:
+                        forecast['yhat'] = np.expm1(forecast['yhat'])
+                        forecast['yhat_lower'] = np.expm1(forecast['yhat_lower'])
+                        forecast['yhat_upper'] = np.expm1(forecast['yhat_upper'])
+                    
+                    # Handle negative predictions (common in Prophet, but physically impossible for counts)
+                    forecast['yhat'] = forecast['yhat'].clip(lower=0)
+                    forecast['yhat_lower'] = forecast['yhat_lower'].clip(lower=0)
+                    forecast['yhat_upper'] = forecast['yhat_upper'].clip(lower=0)
                     
                     # Store in session
                     st.session_state['forecast_model'] = m_target
