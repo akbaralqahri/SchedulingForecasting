@@ -10,6 +10,7 @@ import warnings
 import os
 from io import BytesIO
 from itertools import product
+import mysql.connector # Library untuk koneksi MySQL
 
 warnings.filterwarnings('ignore')
 
@@ -152,6 +153,78 @@ def load_local_csv(file_path):
         return None
     except Exception as e:
         st.error(f"❌ Error loading file: {str(e)}")
+        return None
+
+# --- DATABASE FUNCTIONS ---
+
+def get_database_list(host, port, user, password):
+    """Connect to MySQL and retrieve list of available databases"""
+    try:
+        conn = mysql.connector.connect(
+            host=host,
+            port=int(port),
+            user=user,
+            password=password
+        )
+        cursor = conn.cursor()
+        cursor.execute("SHOW DATABASES")
+        databases = [db[0] for db in cursor.fetchall()]
+        conn.close()
+        return databases
+    except mysql.connector.Error as err:
+        st.error(f"❌ Koneksi Gagal: {err}")
+        return []
+    except Exception as e:
+        st.error(f"❌ Error: {e}")
+        return []
+
+@st.cache_data(show_spinner=False, ttl=3600) 
+def fetch_data_from_db(host, port, user, password, selected_db):
+    """Fetch data dynamically from selected MySQL Database"""
+    
+    # Construct Dynamic Query
+    # Using f-string to inject database name into the query structure
+    query = f"""
+    /* --- 1. DATA USER --- */
+    SELECT id, created_at, '{selected_db}' AS source_database, 'User' AS kategori
+    FROM {selected_db}.tbl_users
+    WHERE role_id = 1 and created_at is not null
+
+    UNION ALL
+
+    /* --- 2. DATA AKTIVITAS --- */
+    SELECT id, created_at, '{selected_db}' AS source_database, 'Aktivitas' AS kategori
+    FROM {selected_db}.trans_attempts
+    where created_at is not null
+
+    UNION ALL
+
+    /* --- 3. DATA TRANSAKSI --- */
+    SELECT id, created_at, '{selected_db}' AS source_database, 'Transaksi' AS kategori
+    FROM {selected_db}.trans_payment_transactions
+    WHERE status = 1 and created_at is not null
+
+    ORDER BY created_at DESC;
+    """
+
+    try:
+        conn = mysql.connector.connect(
+            host=host,
+            port=int(port),
+            user=user,
+            password=password,
+            database=selected_db
+        )
+        
+        df = pd.read_sql(query, conn)
+        conn.close()
+        return df
+    
+    except mysql.connector.Error as err:
+        st.error(f"❌ Database Error: {err}")
+        return None
+    except Exception as e:
+        st.error(f"❌ General Error: {e}")
         return None
 
 @st.cache_data(show_spinner=False)
@@ -405,6 +478,8 @@ if 'model_params' not in st.session_state:
     st.session_state['model_params'] = {}
 if 'auto_tuned_params' not in st.session_state:
     st.session_state['auto_tuned_params'] = None
+if 'db_list' not in st.session_state:
+    st.session_state['db_list'] = []
 
 # --- Sidebar ---
 
@@ -413,7 +488,7 @@ with st.sidebar:
     
     data_source = st.radio(
         "Sumber Data:", 
-        ["📂 Data Demo", "☁️ Upload CSV", "🖥️ File Lokal (>200MB)"]
+        ["📂 Data Demo", "☁️ Upload CSV", "🖥️ File Lokal (>200MB)", "🔌 Database MySQL"]
     )
     
     # Reset data if source changes
@@ -421,7 +496,46 @@ with st.sidebar:
         st.session_state['data_source_mode'] = data_source
         st.session_state['df_raw'] = None
     
-    if data_source == "☁️ Upload CSV":
+    if data_source == "🔌 Database MySQL":
+        st.info("ℹ️ Koneksi langsung ke database MySQL.")
+        
+        with st.expander("🔑 Kredensial Database", expanded=True):
+            db_host = st.text_input("Host IP", "")
+            db_port = st.text_input("Port", "")
+            db_user = st.text_input("Username", "")
+            db_pass = st.text_input("Password", type="password")
+            
+            if st.button("🔗 Cek Koneksi & Ambil DB"):
+                with st.spinner("Menghubungkan..."):
+                    dbs = get_database_list(db_host, db_port, db_user, db_pass)
+                    if dbs:
+                        st.session_state['db_list'] = dbs
+                        st.success(f"✅ Terhubung! Ditemukan {len(dbs)} database.")
+                    else:
+                        st.session_state['db_list'] = []
+        
+        if st.session_state['db_list']:
+            selected_db = st.selectbox(
+                "Pilih Database:", 
+                st.session_state['db_list'],
+                index=st.session_state['db_list'].index('jadisekdin_base') if 'jadisekdin_base' in st.session_state['db_list'] else 0
+            )
+            
+            if st.button("📥 Tarik Data"):
+                with st.spinner(f"Menarik data dari '{selected_db}'..."):
+                    loaded_df = fetch_data_from_db(db_host, db_port, db_user, db_pass, selected_db)
+                    if loaded_df is not None and not loaded_df.empty:
+                        st.session_state['df_raw'] = loaded_df
+                        st.success(f"✅ Berhasil menarik {len(loaded_df)} baris data!")
+                    elif loaded_df is not None and loaded_df.empty:
+                        st.warning("⚠️ Query berhasil, tetapi data kosong.")
+                    else:
+                        st.error("❌ Gagal menarik data.")
+
+        if st.session_state['df_raw'] is not None:
+            st.success("✅ Data Database Tersimpan di Memori")
+
+    elif data_source == "☁️ Upload CSV":
         uploaded_file = st.file_uploader("Upload CSV (dengan kolom 'created_at' dan 'kategori')", type=['csv'])
         if uploaded_file:
             try:

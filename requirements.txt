@@ -5,3 +5,4 @@ plotly
 prophet
 scikit-learn
 openpyxl
+mysql-connector-python
