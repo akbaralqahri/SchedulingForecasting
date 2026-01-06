@@ -1304,49 +1304,65 @@ with tab1:
         
         st.plotly_chart(fig, use_container_width=True)
         
-        # --- DISPLAY EVENT PHASES ---
+        # --- DISPLAY EVENT PHASES (MODIFIED: TOP 5 PRIORITY) ---
         if event_phases:
-            st.markdown("### 📅 Fase-Fase Event Terdeteksi")
+            # 1. Hitung statistik untuk menentukan prioritas
+            # Kita urutkan berdasarkan 'peak_value' dari yang terbesar
+            sorted_events = sorted(event_phases, key=lambda x: x['peak_value'], reverse=True)
             
-            for i, phase in enumerate(event_phases, 1):
-                with st.expander(f"Event #{i}: {phase['peak_start'].strftime('%d %b')} - {phase['peak_end'].strftime('%d %b %Y')}", expanded=True):
+            # 2. Ambil hanya Top 5 Event terbesar
+            top_n = 5
+            priority_events = sorted_events[:top_n]
+            
+            st.markdown(f"### 📅 Top {len(priority_events)} Event Prioritas Tahun {target_year}")
+            st.caption(f"Diurutkan berdasarkan dampak terbesar (Peak Value). Total event terdeteksi: {len(event_phases)}")
+            
+            for i, phase in enumerate(priority_events, 1):
+                # Tentukan warna badge berdasarkan urutan prioritas
+                priority_label = "🔥 HIGH PRIORITY" if i <= 2 else "⚠️ MEDIUM PRIORITY"
+                
+                with st.expander(f"#{i} {priority_label}: {phase['peak_start'].strftime('%d %b')} - {phase['peak_end'].strftime('%d %b %Y')} (Peak: {phase['peak_value']:,.0f})", expanded=(i==1)):
                     
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
                         st.markdown(f"""
                         <div class="event-card pra-event">
-                            <h4>🟡 Fase Persiapan</h4>
-                            <p><strong>Periode:</strong><br>{phase['pra_start'].strftime('%d %b')} - {phase['pra_end'].strftime('%d %b %Y')}</p>
+                            <h4>🟡 Fase Persiapan (Mulai Stok/Server)</h4>
+                            <p><strong>Mulai:</strong> {phase['pra_start'].strftime('%d %b %Y')}</p>
                             <p><strong>Durasi:</strong> {(phase['pra_end'] - phase['pra_start']).days + 1} hari</p>
                         </div>
                         """, unsafe_allow_html=True)
                         # Add to Calendar Button (Pra-Event)
-                        url_pra = create_gcal_link(f"Pra-Event: {target_col}", phase['pra_start'], phase['pra_end'], "Persiapan menghadapi lonjakan trafik.")
-                        st.link_button("📅 Add to GCal (Pra)", url_pra)
+                        url_pra = create_gcal_link(f"Pra-Event {target_col}: Persiapan", phase['pra_start'], phase['pra_end'], "Mulai scaling server dan stok.")
+                        st.markdown(f"[📅 Simpan ke Kalender]({url_pra})", unsafe_allow_html=True)
                     
                     with col2:
                         st.markdown(f"""
                         <div class="event-card peak-event">
-                            <h4>🔴 Fase Peak</h4>
-                            <p><strong>Periode:</strong><br>{phase['peak_start'].strftime('%d %b')} - {phase['peak_end'].strftime('%d %b %Y')}</p>
-                            <p><strong>Peak Value:</strong> {phase['peak_value']:.0f}</p>
+                            <h4>🔴 Fase Puncak (Beban Maksimal)</h4>
+                            <p><strong>Estimasi Tertinggi:</strong> {phase['peak_value']:,.0f}</p>
+                            <p><strong>Periode Rawan:</strong> {phase['peak_start'].strftime('%d %b')} - {phase['peak_end'].strftime('%d %b')}</p>
                         </div>
                         """, unsafe_allow_html=True)
                         # Add to Calendar Button (Peak)
-                        url_peak = create_gcal_link(f"PEAK Event: {target_col}", phase['peak_start'], phase['peak_end'], f"Estimasi Peak Value: {phase['peak_value']:.0f}")
-                        st.link_button("📅 Add to GCal (Peak)", url_peak)
+                        url_peak = create_gcal_link(f"PEAK {target_col}: Siaga 1", phase['peak_start'], phase['peak_end'], f"Estimasi beban puncak: {phase['peak_value']:,.0f}")
+                        st.markdown(f"[📅 Simpan ke Kalender]({url_peak})", unsafe_allow_html=True)
                     
                     with col3:
                         st.markdown(f"""
                         <div class="event-card pasca-event">
-                            <h4>🟢 Fase Monitoring</h4>
-                            <p><strong>Periode:</strong><br>{phase['pasca_start'].strftime('%d %b')} - {phase['pasca_end'].strftime('%d %b %Y')}</p>
+                            <h4>🟢 Fase Monitoring & Evaluasi</h4>
+                            <p><strong>Selesai:</strong> {phase['pasca_end'].strftime('%d %b %Y')}</p>
                             <p><strong>Durasi:</strong> {(phase['pasca_end'] - phase['pasca_start']).days + 1} hari</p>
                         </div>
                         """, unsafe_allow_html=True)
+                    
+                    # Insight Otomatis
+                    st.info(f"💡 **Insight:** Event ini diprediksi memiliki beban **{phase['peak_value']:,.0f} {target_col}**. Tim harus dalam kondisi *standby* penuh mulai tanggal **{phase['peak_start'].strftime('%d %b')}**.")
+
         else:
-            st.info("ℹ️ Tidak ada lonjakan signifikan terdeteksi. Coba turunkan nilai sensitivitas threshold.")
+            st.info("ℹ️ Tidak ada lonjakan signifikan terdeteksi. Coba turunkan nilai sensitivitas threshold di Sidebar.")
 
 with tab2:
     st.subheader("🔗 Analisis Korelasi Antar Variabel")
