@@ -11,6 +11,7 @@ import os
 from io import BytesIO
 from itertools import product
 import mysql.connector # Library untuk koneksi MySQL
+import urllib.parse # Library untuk format URL Google Calendar
 
 warnings.filterwarnings('ignore')
 
@@ -50,7 +51,7 @@ st.markdown("""
     .event-card {
         padding: 1rem;
         border-radius: 8px;
-        margin-bottom: 1rem;
+        margin-bottom: 0.5rem;
         border-left: 5px solid #ccc;
         background-color: #fff;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
@@ -83,6 +84,32 @@ st.markdown('<p class="main-header">📈 Cerebrum Multivariate Forecasting Syste
 st.markdown("**Sistem Prediksi Cerdas: Deteksi Pola Pra-Event, Peak Time, & Pasca-Event**")
 
 # --- Helper Functions ---
+
+# --- GOOGLE CALENDAR HELPER ---
+def create_gcal_link(title, start_date, end_date, description, location="Online/On-Site"):
+    """
+    Generate Google Calendar Link
+    Note: For all-day events in GCal, end date is exclusive (must be +1 day)
+    """
+    # Format: YYYYMMDD
+    start_str = start_date.strftime('%Y%m%d')
+    # Add 1 day to end date because GCal All-Day event end date is exclusive
+    end_dt_obj = end_date + timedelta(days=1)
+    end_str = end_dt_obj.strftime('%Y%m%d')
+    
+    base_url = "https://www.google.com/calendar/render?action=TEMPLATE"
+    params = {
+        "text": title,
+        "dates": f"{start_str}/{end_str}",
+        "details": description,
+        "location": location
+    }
+    query_string = urllib.parse.urlencode(params)
+    return f"{base_url}&{query_string}"
+
+# --- LOGGING FUNCTIONALITY ---
+# CONSTANT: Database khusus untuk menyimpan log
+LOG_DB_NAME = 'cerebrum_forecast_logs'
 
 @st.cache_data(show_spinner=False)
 def generate_dummy_data():
@@ -157,33 +184,39 @@ def load_local_csv(file_path):
 
 # --- DATABASE FUNCTIONS ---
 
-def get_database_list(host, port, user, password):
-    """Connect to MySQL and retrieve list of available databases"""
+def get_db_connection(host, port, user, password, database=None):
+    """Generic function to get DB connection"""
     try:
-        conn = mysql.connector.connect(
+        return mysql.connector.connect(
             host=host,
             port=int(port),
             user=user,
-            password=password
+            password=password,
+            database=database
         )
-        cursor = conn.cursor()
-        cursor.execute("SHOW DATABASES")
-        databases = [db[0] for db in cursor.fetchall()]
-        conn.close()
-        return databases
     except mysql.connector.Error as err:
-        st.error(f"❌ Koneksi Gagal: {err}")
-        return []
-    except Exception as e:
-        st.error(f"❌ Error: {e}")
-        return []
+        st.error(f"❌ Koneksi Database Error ({database}): {err}")
+        return None
+
+def get_database_list(host, port, user, password):
+    """Connect to MySQL and retrieve list of available databases"""
+    conn = get_db_connection(host, port, user, password)
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SHOW DATABASES")
+            databases = [db[0] for db in cursor.fetchall()]
+            conn.close()
+            return databases
+        except Exception as e:
+            st.error(f"Error fetching databases: {e}")
+            return []
+    return []
 
 @st.cache_data(show_spinner=False, ttl=3600) 
 def fetch_data_from_db(host, port, user, password, selected_db):
     """Fetch data dynamically from selected MySQL Database"""
     
-    # Construct Dynamic Query
-    # Using f-string to inject database name into the query structure
     query = f"""
     /* --- 1. DATA USER --- */
     SELECT id, created_at, '{selected_db}' AS source_database, 'User' AS kategori
@@ -207,25 +240,129 @@ def fetch_data_from_db(host, port, user, password, selected_db):
     ORDER BY created_at DESC;
     """
 
-    try:
-        conn = mysql.connector.connect(
-            host=host,
-            port=int(port),
-            user=user,
-            password=password,
-            database=selected_db
-        )
-        
-        df = pd.read_sql(query, conn)
-        conn.close()
-        return df
+    conn = get_db_connection(host, port, user, password, selected_db)
+    if conn:
+        try:
+            df = pd.read_sql(query, conn)
+            conn.close()
+            return df
+        except Exception as e:
+            st.error(f"❌ Error Executing Query: {e}")
+            return None
+    return None
+
+# --- 3. EVENT LOG CRUD OPERATIONS (ISOLATED DATABASE) ---
+
+def init_log_table(host, port, user, password):
+    """Create event_logs table in the dedicated log database if not exists"""
+    # Note: Connecting directly to LOG_DB_NAME
+    conn = get_db_connection(host, port, user, password, LOG_DB_NAME)
     
-    except mysql.connector.Error as err:
-        st.error(f"❌ Database Error: {err}")
-        return None
+    if conn is None:
+        st.error(f"❌ Gagal koneksi ke database log '{LOG_DB_NAME}'. Pastikan database ini sudah dibuat di MySQL.")
+        return False
+        
+    try:
+        cursor = conn.cursor()
+        query = """
+        CREATE TABLE IF NOT EXISTS event_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            event_name VARCHAR(255) NOT NULL,
+            start_date DATE NOT NULL,
+            end_date DATE NOT NULL,
+            description TEXT,
+            source_database VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        );
+        """
+        cursor.execute(query)
+        conn.commit()
+        conn.close()
+        return True
     except Exception as e:
-        st.error(f"❌ General Error: {e}")
-        return None
+        st.error(f"Gagal membuat tabel log: {e}")
+        return False
+
+def fetch_event_logs_db(host, port, user, password, filter_source_db):
+    """Read logs from dedicated Log DB, filtered by source_database"""
+    conn = get_db_connection(host, port, user, password, LOG_DB_NAME)
+    if conn:
+        try:
+            # Only fetch logs relevant to the currently analyzed database
+            query = "SELECT id, event_name, start_date, end_date, description, source_database, created_at FROM event_logs WHERE source_database = %s ORDER BY start_date DESC"
+            df = pd.read_sql(query, conn, params=(filter_source_db,))
+            conn.close()
+            return df
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def insert_event_log_db(host, port, user, password, data):
+    """Insert new log to dedicated Log DB"""
+    conn = get_db_connection(host, port, user, password, LOG_DB_NAME)
+    if conn:
+        try:
+            cursor = conn.cursor()
+            query = "INSERT INTO event_logs (event_name, start_date, end_date, description, source_database) VALUES (%s, %s, %s, %s, %s)"
+            cursor.execute(query, data)
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            st.error(f"Gagal Insert: {e}")
+            return False
+    return False
+
+def update_event_log_db(host, port, user, password, log_id, event_name, start_date, end_date, description):
+    """Update existing log in dedicated Log DB"""
+    conn = get_db_connection(host, port, user, password, LOG_DB_NAME)
+    if conn:
+        try:
+            cursor = conn.cursor()
+            query = """
+                UPDATE event_logs 
+                SET event_name=%s, start_date=%s, end_date=%s, description=%s 
+                WHERE id=%s
+            """
+            cursor.execute(query, (event_name, start_date, end_date, description, int(log_id)))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            st.error(f"Gagal Update: {e}")
+            return False
+    return False
+
+def delete_event_log_db(host, port, user, password, log_id):
+    """Delete log from dedicated Log DB"""
+    conn = get_db_connection(host, port, user, password, LOG_DB_NAME)
+    if conn:
+        try:
+            cursor = conn.cursor()
+            query = "DELETE FROM event_logs WHERE id = %s"
+            cursor.execute(query, (int(log_id),))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            st.error(f"Gagal Delete: {e}")
+            return False
+    return False
+
+# --- EXCEL GENERATOR FOR TEMPLATE ---
+def generate_excel_template():
+    # Menggunakan format dd-mm-yyyy untuk contoh tanggal
+    df = pd.DataFrame({
+        'Nama Event': ['Promo Lebaran', 'Flash Sale 12.12', 'UTBK - Pendaftaran'],
+        'Tanggal Mulai': ['01-03-2025', '12-12-2025', '10-04-2025'], # Format dd-mm-yyyy
+        'Tanggal Selesai': ['15-03-2025', '14-12-2025', '20-04-2025'], # Format dd-mm-yyyy
+        'Deskripsi': ['Diskon 50%', 'Flash sale akhir tahun', 'Masa pendaftaran']
+    })
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False)
+    return output.getvalue()
 
 @st.cache_data(show_spinner=False)
 def process_multivariate_data(df):
@@ -239,12 +376,17 @@ def process_multivariate_data(df):
         return None
     
     # Ensure datetime with better error handling
-    if not pd.api.types.is_datetime64_any_dtype(df['created_at']):
-        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
+    # coerce errors to NaT, so we can drop them later
+    df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
     
-    # Remove invalid dates
+    # Remove invalid dates (NaT) immediately
     initial_len = len(df)
     df = df.dropna(subset=['created_at'])
+    
+    if len(df) == 0:
+        st.error("❌ Semua data tanggal tidak valid atau kosong. Periksa format CSV Anda.")
+        return None
+
     if len(df) < initial_len:
         st.warning(f"⚠️ {initial_len - len(df)} baris dengan tanggal invalid dihapus")
     
@@ -260,14 +402,29 @@ def process_multivariate_data(df):
     # Add Total column
     daily_pivot['Total'] = daily_pivot.sum(axis=1)
     
+    # Validasi Range sebelum reindex
+    if daily_pivot.index.empty:
+         st.error("❌ Data kosong setelah pemrosesan.")
+         return None
+         
+    min_date = daily_pivot.index.min()
+    max_date = daily_pivot.index.max()
+    
+    # Double check if min/max are valid timestamps (not NaT)
+    if pd.isnull(min_date) or pd.isnull(max_date):
+        st.error("❌ Terdeteksi tanggal NaT pada index. Cek format data.")
+        return None
+
     # Fill missing dates with 0
-    full_range = pd.date_range(start=daily_pivot.index.min(), end=daily_pivot.index.max(), freq='D')
-    daily_pivot = daily_pivot.reindex(full_range, fill_value=0)
-    
-    # Ensure index name is clear for later use
-    daily_pivot.index.name = 'date'
-    
-    return daily_pivot
+    try:
+        full_range = pd.date_range(start=min_date, end=max_date, freq='D')
+        daily_pivot = daily_pivot.reindex(full_range, fill_value=0)
+        # Ensure index name is clear for later use
+        daily_pivot.index.name = 'date'
+        return daily_pivot
+    except Exception as e:
+        st.error(f"❌ Error saat membuat date range: {str(e)}")
+        return None
 
 def detect_event_phases(forecast_df, threshold_multiplier=1.5, prep_days=7, post_days=7):
     """
@@ -480,6 +637,10 @@ if 'auto_tuned_params' not in st.session_state:
     st.session_state['auto_tuned_params'] = None
 if 'db_list' not in st.session_state:
     st.session_state['db_list'] = []
+if 'selected_db_name' not in st.session_state:
+    st.session_state['selected_db_name'] = ""
+if 'db_creds' not in st.session_state:
+    st.session_state['db_creds'] = {}
 
 # --- Sidebar ---
 
@@ -500,9 +661,10 @@ with st.sidebar:
         st.info("ℹ️ Koneksi langsung ke database MySQL.")
         
         with st.expander("🔑 Kredensial Database", expanded=True):
-            db_host = st.text_input("Host IP", "")
-            db_port = st.text_input("Port", "")
-            db_user = st.text_input("Username", "")
+            # Default values as requested
+            db_host = st.text_input("Host IP", "34.101.133.82")
+            db_port = st.text_input("Port", "3306")
+            db_user = st.text_input("Username", "product_intern")
             db_pass = st.text_input("Password", type="password")
             
             if st.button("🔗 Cek Koneksi & Ambil DB"):
@@ -510,6 +672,12 @@ with st.sidebar:
                     dbs = get_database_list(db_host, db_port, db_user, db_pass)
                     if dbs:
                         st.session_state['db_list'] = dbs
+                        st.session_state['db_creds'] = {
+                            'host': db_host,
+                            'port': db_port,
+                            'user': db_user,
+                            'pass': db_pass
+                        }
                         st.success(f"✅ Terhubung! Ditemukan {len(dbs)} database.")
                     else:
                         st.session_state['db_list'] = []
@@ -520,6 +688,8 @@ with st.sidebar:
                 st.session_state['db_list'],
                 index=st.session_state['db_list'].index('jadisekdin_base') if 'jadisekdin_base' in st.session_state['db_list'] else 0
             )
+            # Store selected DB for logging
+            st.session_state['selected_db_name'] = selected_db
             
             if st.button("📥 Tarik Data"):
                 with st.spinner(f"Menarik data dari '{selected_db}'..."):
@@ -729,44 +899,48 @@ with st.sidebar:
                         help="Berapa hari monitoring setelah event?"
                     )
 
-            # 5. MANUAL HOLIDAY INPUT
-            with st.expander("📅 Input Jadwal Event Resmi (Opsional)", expanded=False):
-                st.info("""
-                **PENTING:** Input jadwal resmi di sini agar model mengenali pola persiapan sebelum event.
-                Sistem akan otomatis menandai masa persiapan berdasarkan durasi yang Anda tentukan.
-                """)
+            # 5. MANUAL HOLIDAY INPUT (AUTOMATED FROM DB)
+            with st.expander("📅 Jadwal Event Resmi (Aktif)", expanded=True):
                 
+                # Check for manually added holidays first
+                manual_holidays_count = len(st.session_state['custom_holidays'])
+                
+                # Load from event log if database selected
+                log_holidays_count = 0
+                if data_source == "🔌 Database MySQL" and st.session_state['selected_db_name']:
+                    # Try fetch logs, if fail (e.g. table not exist), it returns empty
+                    creds = st.session_state.get('db_creds')
+                    if creds:
+                         db_events = fetch_event_logs_db(creds['host'], creds['port'], creds['user'], creds['pass'], st.session_state['selected_db_name'])
+                         log_holidays_count = len(db_events)
+                    
+                         if log_holidays_count > 0:
+                            st.success(f"✅ {log_holidays_count} event diambil dari Catatan Real ({st.session_state['selected_db_name']})")
+                            st.dataframe(db_events[['event_name', 'start_date', 'end_date']], hide_index=True)
+                         else:
+                            st.info("ℹ️ Belum ada catatan event real di database.")
+                
+                if manual_holidays_count > 0:
+                    st.info(f"📋 {manual_holidays_count} event manual tambahan.")
+                    st.dataframe(pd.DataFrame(st.session_state['custom_holidays']), hide_index=True)
+                
+                if log_holidays_count == 0 and manual_holidays_count == 0:
+                    st.warning("⚠️ Tidak ada jadwal event. Prediksi mungkin kurang akurat saat hari raya/promo.")
+
+                # Manual input form still available for ad-hoc additions
                 col_h1, col_h2 = st.columns(2)
                 with col_h1:
-                    h_name = st.text_input("Nama Event", "Event CPNS", key="holiday_name")
+                    h_name = st.text_input("Tambah Event Manual", key="holiday_name_manual")
                 with col_h2:
-                    h_dates = st.date_input(
-                        "Rentang Tanggal Event", 
-                        [], 
-                        key="holiday_dates",
-                        help="Pilih tanggal mulai dan selesai event"
-                    )
+                    h_dates = st.date_input("Rentang Tanggal", [], key="holiday_dates_manual")
                 
-                if st.button("➕ Tambah Jadwal"):
+                if st.button("➕ Tambah Manual"):
                     if len(h_dates) == 2:
                         st.session_state['custom_holidays'].append({
                             'holiday': h_name,
                             'ds_start': h_dates[0],
                             'ds_end': h_dates[1]
                         })
-                        st.success(f"✅ Jadwal '{h_name}' ditambahkan!")
-                        st.rerun()
-                    else:
-                        st.error("❌ Pilih 2 tanggal (start & end)")
-                
-                # Show added holidays
-                if st.session_state['custom_holidays']:
-                    st.markdown("##### 📋 Jadwal Tersimpan:")
-                    holidays_display = pd.DataFrame(st.session_state['custom_holidays'])
-                    st.dataframe(holidays_display, use_container_width=True, hide_index=True)
-                    
-                    if st.button("🗑️ Reset Semua Jadwal"):
-                        st.session_state['custom_holidays'] = []
                         st.rerun()
 
 # --- Main Logic ---
@@ -782,20 +956,27 @@ if st.session_state['df_daily'] is None:
 df_daily = st.session_state['df_daily']
 
 # Prepare Tabs
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tabs_list = [
     "🔮 Forecast & Fase Event", 
     "🔗 Analisis Korelasi", 
     "📅 Pola Musiman", 
     "🧮 Simulasi Skenario", 
-    "📊 Visualisasi Data",
+    "📊 Visualisasi Data", 
     "📋 Export & Detail"
-])
+]
+
+# Only show "Catatan Event Real" if connected to Database
+if data_source == "🔌 Database MySQL":
+    tabs_list.append("📝 Catatan Event Real")
+
+tabs = st.tabs(tabs_list)
+
+# Assign tabs
+tab1, tab2, tab3, tab4, tab5, tab6 = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4], tabs[5]
+tab7 = tabs[6] if len(tabs) > 6 else None
 
 with tab1:
     st.subheader(f"🎯 Analisis Siklus Event: {target_col} ({target_year})")
-    
-    if st.session_state['custom_holidays']:
-        st.success(f"✅ **Mode Hybrid Aktif:** {len(st.session_state['custom_holidays'])} jadwal event terdaftar")
     
     start_forecast_btn = st.button("🚀 Mulai Analisis", type="primary", use_container_width=True)
 
@@ -804,33 +985,51 @@ with tab1:
             with st.spinner("🔄 Menganalisis pola dan membangun model prediksi..."):
                 
                 try:
-                    # --- INTELLIGENT HOLIDAY GENERATION ---
-                    holidays_df = None
+                    # --- INTELLIGENT HOLIDAY GENERATION (MERGED) ---
+                    holiday_records = []
+                    
+                    # 1. Add from Manual Input
                     if st.session_state['custom_holidays']:
-                        holiday_records = []
                         for h in st.session_state['custom_holidays']:
-                            # Event itself
-                            curr_date = h['ds_start']
-                            while curr_date <= h['ds_end']:
-                                holiday_records.append({
-                                    'holiday': h['holiday'],
-                                    'ds': pd.to_datetime(curr_date)
-                                })
-                                curr_date += timedelta(days=1)
-                            
-                            # Preparation phase
+                            # ... (logic same as before, see full code block) ...
+                            curr = h['ds_start']
+                            while curr <= h['ds_end']:
+                                holiday_records.append({'holiday': h['holiday'], 'ds': pd.to_datetime(curr)})
+                                curr += timedelta(days=1)
+                            # Prep phase logic...
                             start_prep = h['ds_start'] - timedelta(days=prep_days)
                             end_prep = h['ds_start'] - timedelta(days=1)
+                            curr = start_prep
+                            while curr <= end_prep:
+                                holiday_records.append({'holiday': f"Pra-{h['holiday']}", 'ds': pd.to_datetime(curr)})
+                                curr += timedelta(days=1)
+
+                    # 2. Add from Event Log (Database Specific)
+                    if data_source == "🔌 Database MySQL" and st.session_state['selected_db_name'] and st.session_state.get('db_creds'):
+                        creds = st.session_state['db_creds']
+                        db_events = fetch_event_logs_db(creds['host'], creds['port'], creds['user'], creds['pass'], st.session_state['selected_db_name'])
+                        
+                        for _, row in db_events.iterrows():
+                            # Parse dates
+                            start_dt = pd.to_datetime(row['start_date'])
+                            end_dt = pd.to_datetime(row['end_date'])
+                            event_name = row['event_name']
                             
-                            curr_prep = start_prep
-                            while curr_prep <= end_prep:
-                                holiday_records.append({
-                                    'holiday': f"Pra-{h['holiday']}",
-                                    'ds': pd.to_datetime(curr_prep)
-                                })
-                                curr_prep += timedelta(days=1)
+                            # Event days
+                            curr = start_dt
+                            while curr <= end_dt:
+                                holiday_records.append({'holiday': event_name, 'ds': curr})
+                                curr += timedelta(days=1)
                                 
-                        holidays_df = pd.DataFrame(holiday_records)
+                            # Prep phase
+                            start_prep = start_dt - timedelta(days=prep_days)
+                            end_prep = start_dt - timedelta(days=1)
+                            curr = start_prep
+                            while curr <= end_prep:
+                                holiday_records.append({'holiday': f"Pra-{event_name}", 'ds': curr})
+                                curr += timedelta(days=1)
+
+                    holidays_df = pd.DataFrame(holiday_records) if holiday_records else None
 
                     # 1. Setup Training and Testing Data
                     train_data = df_daily[df_daily.index.year < target_year].copy()
@@ -1088,31 +1287,11 @@ with tab1:
         )
         
         # Mark event phases
-        for phase in event_phases:
-            # Pra-Event
-            fig.add_vrect(
-                x0=phase['pra_start'], x1=phase['pra_end'],
-                fillcolor="orange", opacity=0.15,
-                layer="below", line_width=0,
-                annotation_text="Pra-Event",
-                annotation_position="top left"
-            )
-            # Peak
-            fig.add_vrect(
-                x0=phase['peak_start'], x1=phase['peak_end'],
-                fillcolor="red", opacity=0.2,
-                layer="below", line_width=0,
-                annotation_text="PEAK",
-                annotation_position="top left"
-            )
-            # Pasca-Event
-            fig.add_vrect(
-                x0=phase['pasca_start'], x1=phase['pasca_end'],
-                fillcolor="green", opacity=0.15,
-                layer="below", line_width=0,
-                annotation_text="Pasca-Event",
-                annotation_position="top left"
-            )
+        for i, phase in enumerate(event_phases, 1):
+            # ... existing rectangle drawing logic ...
+            fig.add_vrect(x0=phase['pra_start'], x1=phase['pra_end'], fillcolor="orange", opacity=0.15, layer="below", line_width=0, annotation_text="Pra-Event", annotation_position="top left")
+            fig.add_vrect(x0=phase['peak_start'], x1=phase['peak_end'], fillcolor="red", opacity=0.2, layer="below", line_width=0, annotation_text="PEAK", annotation_position="top left")
+            fig.add_vrect(x0=phase['pasca_start'], x1=phase['pasca_end'], fillcolor="green", opacity=0.15, layer="below", line_width=0, annotation_text="Pasca-Event", annotation_position="top left")
         
         fig.update_layout(
             title=f"Prediksi {target_col} - Tahun {target_year}",
@@ -1142,6 +1321,9 @@ with tab1:
                             <p><strong>Durasi:</strong> {(phase['pra_end'] - phase['pra_start']).days + 1} hari</p>
                         </div>
                         """, unsafe_allow_html=True)
+                        # Add to Calendar Button (Pra-Event)
+                        url_pra = create_gcal_link(f"Pra-Event: {target_col}", phase['pra_start'], phase['pra_end'], "Persiapan menghadapi lonjakan trafik.")
+                        st.link_button("📅 Add to GCal (Pra)", url_pra)
                     
                     with col2:
                         st.markdown(f"""
@@ -1151,6 +1333,9 @@ with tab1:
                             <p><strong>Peak Value:</strong> {phase['peak_value']:.0f}</p>
                         </div>
                         """, unsafe_allow_html=True)
+                        # Add to Calendar Button (Peak)
+                        url_peak = create_gcal_link(f"PEAK Event: {target_col}", phase['peak_start'], phase['peak_end'], f"Estimasi Peak Value: {phase['peak_value']:.0f}")
+                        st.link_button("📅 Add to GCal (Peak)", url_peak)
                     
                     with col3:
                         st.markdown(f"""
@@ -1160,25 +1345,6 @@ with tab1:
                             <p><strong>Durasi:</strong> {(phase['pasca_end'] - phase['pasca_start']).days + 1} hari</p>
                         </div>
                         """, unsafe_allow_html=True)
-                    
-                    # Recommendations
-                    st.markdown("#### 💡 Rekomendasi Aksi")
-                    st.info(f"""
-                    **Persiapan ({phase['pra_start'].strftime('%d %b')} - {phase['pra_end'].strftime('%d %b')}):**
-                    - Scaling infrastruktur server
-                    - Stock monitoring dan supply chain preparation
-                    - Team briefing dan resource allocation
-                    
-                    **Peak Time ({phase['peak_start'].strftime('%d %b')} - {phase['peak_end'].strftime('%d %b')}):**
-                    - 24/7 monitoring aktif
-                    - Quick response team standby
-                    - Real-time dashboard monitoring
-                    
-                    **Pasca Event ({phase['pasca_start'].strftime('%d %b')} - {phase['pasca_end'].strftime('%d %b')}):**
-                    - Post-mortem analysis
-                    - Performance metrics evaluation
-                    - Lessons learned documentation
-                    """)
         else:
             st.info("ℹ️ Tidak ada lonjakan signifikan terdeteksi. Coba turunkan nilai sensitivitas threshold.")
 
@@ -1417,6 +1583,152 @@ with tab6:
             )
     else:
         st.info("ℹ️ Belum ada data forecast. Jalankan analisis terlebih dahulu.")
+
+# --- TAB 7: DATABASE LOGGING (NEW & IMPROVED) ---
+if data_source == "🔌 Database MySQL" and len(tabs) > 6:
+    with tabs[6]:
+        st.subheader(f"📝 Database Event Real: {st.session_state.get('selected_db_name', 'Unknown')}")
+        
+        creds = st.session_state.get('db_creds', {})
+        if not creds:
+            st.error("Silakan koneksikan database di sidebar terlebih dahulu.")
+        else:
+            # Check/Create table in isolated LOG DB
+            init_log_table(creds['host'], creds['port'], creds['user'], creds['pass'])
+            
+            with st.expander("📤 Import / Export Jadwal (Excel)", expanded=False):
+                col_ex1, col_ex2 = st.columns(2)
+                with col_ex1:
+                    st.markdown("#### 1. Download Template")
+                    st.caption("Gunakan format ini untuk upload data.")
+                    template_data = generate_excel_template()
+                    st.download_button(
+                        label="📥 Download Template Excel",
+                        data=template_data,
+                        file_name="template_jadwal_event.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                with col_ex2:
+                    st.markdown("#### 2. Upload Jadwal")
+                    st.caption("Upload file Excel yang sudah diisi.")
+                    uploaded_excel = st.file_uploader("Pilih file Excel (.xlsx)", type=['xlsx'])
+                    
+                    if uploaded_excel:
+                        try:
+                            df_import = pd.read_excel(uploaded_excel)
+                            # Validate columns
+                            required_cols = ['Nama Event', 'Tanggal Mulai', 'Tanggal Selesai']
+                            if all(col in df_import.columns for col in required_cols):
+                                st.success("✅ Format valid! Preview data:")
+                                st.dataframe(df_import.head())
+                                
+                                if st.button("💾 Simpan Data Import ke Database"):
+                                    success_count = 0
+                                    for _, row in df_import.iterrows():
+                                        # Use default value if Deskripsi missing
+                                        desc = row['Deskripsi'] if 'Deskripsi' in row else ''
+                                        
+                                        # Format dates to ensure they are python date objects or strings YYYY-MM-DD
+                                        try:
+                                            # Handle format dd-mm-yyyy explicitly
+                                            # dayfirst=True membantu pandas mengenali format 01-03-2025 sebagai 1 Maret, bukan 3 Januari
+                                            s_date = pd.to_datetime(row['Tanggal Mulai'], dayfirst=True).date()
+                                            e_date = pd.to_datetime(row['Tanggal Selesai'], dayfirst=True).date()
+                                            
+                                            insert_event_log_db(
+                                                creds['host'], creds['port'], creds['user'], creds['pass'],
+                                                (
+                                                    row['Nama Event'],
+                                                    s_date,
+                                                    e_date,
+                                                    desc,
+                                                    st.session_state['selected_db_name']
+                                                )
+                                            )
+                                            success_count += 1
+                                        except Exception as e:
+                                            st.error(f"Gagal import baris {row['Nama Event']}: {e}")
+                                    
+                                    if success_count > 0:
+                                        st.success(f"Berhasil mengimport {success_count} jadwal event!")
+                                        st.rerun()
+                            else:
+                                st.error(f"Format salah. Kolom wajib: {', '.join(required_cols)}")
+                        except Exception as e:
+                            st.error(f"Error membaca file: {e}")
+
+            # 1. VIEW & EDIT DATA
+            st.markdown("##### 📋 Data Event (Editable)")
+            st.info("💡 Edit langsung di tabel lalu klik 'Simpan Perubahan'. Klik icon tong sampah untuk menghapus.")
+            
+            # Load fresh data filtered by current analyzed DB
+            df_logs = fetch_event_logs_db(creds['host'], creds['port'], creds['user'], creds['pass'], st.session_state.get('selected_db_name'))
+            
+            # Prepare dataframe for editor (convert dates to proper type)
+            if not df_logs.empty:
+                df_logs['start_date'] = pd.to_datetime(df_logs['start_date']).dt.date
+                df_logs['end_date'] = pd.to_datetime(df_logs['end_date']).dt.date
+            
+            # --- EDITOR CONFIG ---
+            edited_df = st.data_editor(
+                df_logs,
+                num_rows="dynamic",
+                column_config={
+                    "id": st.column_config.NumberColumn(disabled=True),
+                    "created_at": st.column_config.DatetimeColumn(disabled=True),
+                    "source_database": st.column_config.TextColumn(disabled=True),
+                    "start_date": st.column_config.DateColumn("Mulai", format="YYYY-MM-DD"),
+                    "end_date": st.column_config.DateColumn("Selesai", format="YYYY-MM-DD"),
+                    "event_name": "Nama Event",
+                    "description": "Deskripsi"
+                },
+                key="event_editor"
+            )
+            
+            # --- SYNC BUTTON ---
+            if st.button("💾 Simpan Perubahan ke Database"):
+                changes = st.session_state["event_editor"]
+                
+                # A. Handle Added Rows
+                for row in changes["added_rows"]:
+                    insert_event_log_db(
+                        creds['host'], creds['port'], creds['user'], creds['pass'],
+                        (
+                            row.get('event_name', 'New Event'),
+                            row.get('start_date', datetime.now().date()),
+                            row.get('end_date', datetime.now().date()),
+                            row.get('description', ''),
+                            st.session_state['selected_db_name']
+                        )
+                    )
+                
+                # B. Handle Deleted Rows
+                for idx in changes["deleted_rows"]:
+                    # Get the ID of the deleted row from original dataframe
+                    # Careful with index if user edits + deletes
+                    if idx < len(df_logs):
+                        log_id_to_delete = df_logs.iloc[idx]['id']
+                        delete_event_log_db(creds['host'], creds['port'], creds['user'], creds['pass'], log_id_to_delete)
+                
+                # C. Handle Edited Rows
+                for idx, row_changes in changes["edited_rows"].items():
+                    if idx < len(df_logs):
+                        log_id_to_edit = df_logs.iloc[idx]['id']
+                        original_row = df_logs.iloc[idx]
+                        
+                        new_name = row_changes.get('event_name', original_row['event_name'])
+                        new_start = row_changes.get('start_date', original_row['start_date'])
+                        new_end = row_changes.get('end_date', original_row['end_date'])
+                        new_desc = row_changes.get('description', original_row['description'])
+                        
+                        update_event_log_db(
+                            creds['host'], creds['port'], creds['user'], creds['pass'],
+                            log_id_to_edit, new_name, new_start, new_end, new_desc
+                        )
+                
+                st.success("✅ Database berhasil diperbarui!")
+                st.rerun()
 
 # Footer
 st.markdown("---")
